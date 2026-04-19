@@ -1,4 +1,4 @@
-# MASTER PROMPT — Final Version (All Issues Fixed)
+# MASTER PROMPT — Final Version v2 (PostgreSQL + All Fixes Applied)
 
 Copy everything below this line and paste it into Claude (VS Code / Claude Code).
 Give it in 3 parts as instructed at the bottom of this document.
@@ -31,7 +31,8 @@ You are building:
 10. **JSON merge logic** (apply approved updates to the master patient JSON)
 11. **Audit trail** (record every change with field_path, old_value, new_value, source_phrase, confidence, timestamp)
 12. **Push notifications via SNS** at three specific moments: when human review is needed, when pipeline completes successfully, and when pipeline fails
-13. **Integration with AWS services** via boto3 (S3, DynamoDB, SQS, Cognito, SNS)
+13. **Integration with AWS services** via boto3 (S3, SQS, Cognito, SNS, Transcribe Medical, Bedrock) and **PostgreSQL via SQLAlchemy** for all database operations
+14. **Database schema and migrations** using SQLAlchemy models and Alembic
 
 ## NOT Your Responsibility (another team handles these)
 
@@ -46,26 +47,28 @@ Create placeholder/mock versions of the team's functions for testing.
 
 ### Tech Stack
 - **Framework:** FastAPI (Python 3.11+)
-- **Pipeline orchestration:** LangGraph (with DynamoDB checkpoint backend)
+- **Pipeline orchestration:** LangGraph (with PostgreSQL checkpoint backend via langgraph-checkpoint-postgres — the official, most stable LangGraph checkpointer)
 - **Job queue:** Amazon SQS (decouples API from pipeline execution)
 - **Speech-to-text:** Amazon Transcribe Medical (via boto3, NOT Whisper)
 - **LLM:** Amazon Bedrock + Claude Sonnet (via boto3, NOT local models, NOT OpenAI)
 - **File storage:** Amazon S3 (via boto3) — Flutter uploads directly using presigned URLs
-- **Database:** Amazon DynamoDB (via boto3) — NOT PostgreSQL, NOT SQLite
+- **Database:** PostgreSQL on Amazon RDS (via SQLAlchemy + asyncpg) — NOT DynamoDB, NOT SQLite
 - **Authentication:** Amazon Cognito (validate JWT tokens from the Flutter app)
 - **Push notifications:** Amazon SNS (via boto3)
 - **PDF parsing:** NOT your job — assume the function exists
 - **PDF generation:** NOT your job — assume the function exists
 
 ### Key Rules
-- All config (AWS region, S3 bucket names, DynamoDB table names, SQS URL, confidence threshold) must come from environment variables via a config.py file. Never hardcode AWS resource names.
+- All config (AWS region, S3 bucket names, DATABASE_URL, SQS URL, confidence threshold) must come from environment variables via a config.py file. Never hardcode AWS resource names or database credentials.
 - Temperature for all Bedrock Claude calls: 0.1 (deterministic, not creative)
 - Confidence threshold: 0.85 (configurable via env var)
 - All patient data is PHI — NEVER log patient names, SSN, DOB, or any identifiable information. Log only patient_id, field_paths, confidence scores, and pipeline status.
 - FastAPI endpoints must return IMMEDIATELY. Pipeline execution happens asynchronously via SQS + background worker. The caregiver never waits for processing to complete.
-- Use async where possible (FastAPI is async-native)
+- Use async where possible (FastAPI is async-native, use async SQLAlchemy sessions)
 - Every function must have type hints and a docstring
 - Use Pydantic models for all request/response schemas
+- Use SQLAlchemy ORM models for all database tables
+- Use Alembic for database schema migrations
 
 ### File Upload Architecture (IMPORTANT)
 - The Flutter app NEVER sends files to FastAPI.
@@ -89,12 +92,15 @@ samni-backend/
 ├── main.py                    # FastAPI app, 7 endpoints, startup
 ├── worker.py                  # SQS background worker, polls queue, runs pipelines
 ├── config.py                  # All configuration from environment variables
+├── database.py                # SQLAlchemy async engine, session factory, Base
+├── db_models.py               # SQLAlchemy table models (patients, audit_trail, pipeline_runs)
 ├── pipeline.py                # LangGraph graph definitions (intake + reassessment)
 ├── state.py                   # PipelineState TypedDict (shared state between nodes)
 ├── nodes/
 │   ├── __init__.py
+|   |-- load_patient_json.py   # # Load existing patient JSON from PostgreSQL
 │   ├── parse_pdf.py           # PLACEHOLDER — calls team's parser, returns JSON
-│   ├── save_json.py           # Save patient JSON to DynamoDB
+│   ├── save_json.py           # Save patient JSON to PostgreSQL patients table
 │   ├── transcribe.py          # Call Amazon Transcribe Medical via boto3
 │   ├── llm_map.py             # Call Bedrock + Claude for field mapping
 │   ├── llm_critic.py          # Call Bedrock + Claude for self-verification
@@ -102,19 +108,23 @@ samni-backend/
 │   ├── human_review.py        # LangGraph interrupt() for human review
 │   ├── merge.py               # Apply approved updates to master JSON, record audit
 │   ├── generate_pdf.py        # PLACEHOLDER — calls team's PDF generator
-│   └── audit.py               # Write audit trail entries to DynamoDB
+│   └── audit.py               # Write audit trail entries to PostgreSQL audit_trail table
 ├── notifications.py           # SNS push notification helper (3 triggers)
 ├── prompts.py                 # System prompts and user prompt builders for Claude
 ├── models.py                  # Pydantic models for API requests/responses
 ├── auth.py                    # Cognito JWT token validation middleware
-├── aws_clients.py             # Centralized boto3 client initialization
+├── aws_clients.py             # Centralized boto3 client initialization (S3, SQS, Transcribe, Bedrock, SNS, Cognito)
 ├── utils.py                   # Helper functions (get_nested, set_nested, etc.)
+├── alembic.ini                # Alembic migration configuration
+├── alembic/
+│   ├── env.py                 # Alembic environment config
+│   └── versions/              # Migration scripts (auto-generated)
 ├── tests/
 │   ├── test_dictations.json   # 30+ test sentences with expected outputs
 │   ├── test_pipeline.py       # End-to-end pipeline test
 │   ├── test_nodes.py          # Unit tests for individual nodes
 │   ├── test_merge.py          # Unit tests for merge logic
-│   └── conftest.py            # Pytest fixtures (mock AWS clients, sample data)
+│   └── conftest.py            # Pytest fixtures (mock AWS clients, test database)
 ├── requirements.txt
 ├── Dockerfile
 ├── .env.example               # Example environment variables
@@ -131,9 +141,8 @@ Read all config from environment variables with sensible defaults for local deve
 - S3_BUCKET (default: samni-phi-documents-dev)
 - S3_PRESIGNED_EXPIRY (default: 900 — 15 minutes in seconds)
 - SQS_QUEUE_URL (no default, required in production)
-- DYNAMO_PATIENTS_TABLE (default: Patients)
-- DYNAMO_AUDIT_TABLE (default: AuditTrail)
-- DYNAMO_PIPELINE_TABLE (default: PipelineState)
+- DATABASE_URL (default: postgresql+asyncpg://postgres:password@localhost:5432/samni_dev)
+- DATABASE_URL_SYNC (default: postgresql://postgres:password@localhost:5432/samni_dev) — needed for Alembic migrations which run synchronously
 - COGNITO_USER_POOL_ID (no default, required in production)
 - COGNITO_APP_CLIENT_ID (no default, required in production)
 - SNS_TOPIC_ARN (no default, required in production)
@@ -142,6 +151,74 @@ Read all config from environment variables with sensible defaults for local deve
 - WORKER_CONCURRENCY (default: 2 — how many pipeline jobs to run simultaneously)
 - LOG_LEVEL (default: INFO)
 - ENVIRONMENT (default: dev)
+
+### database.py — SQLAlchemy Setup
+
+- Create an async SQLAlchemy engine using `create_async_engine(DATABASE_URL)`
+- Create an async session factory using `async_sessionmaker`
+- Define a `Base` class using `declarative_base()` for all ORM models
+- Provide a `get_db_session()` async context manager for use in FastAPI dependencies and node functions
+- On FastAPI startup, verify database connectivity
+- On FastAPI shutdown, dispose of the engine
+
+### db_models.py — SQLAlchemy Table Models
+
+Define THREE tables:
+
+**Table 1: patients**
+```python
+class Patient(Base):
+    __tablename__ = "patients"
+    
+    patient_id = Column(String, primary_key=True)
+    facility_id = Column(String, nullable=True)
+    assessment = Column(JSONB, nullable=False)       # the full patient JSON (200+ fields)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    updated_by = Column(String, nullable=True)
+```
+
+**Table 2: audit_trail**
+```python
+class AuditEntry(Base):
+    __tablename__ = "audit_trail"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    patient_id = Column(String, ForeignKey("patients.patient_id"), nullable=False, index=True)
+    run_id = Column(String, nullable=False, index=True)
+    field_path = Column(String, nullable=False, index=True)
+    old_value = Column(Text, nullable=True)
+    new_value = Column(Text, nullable=False)
+    source_phrase = Column(Text, nullable=True)
+    confidence = Column(Float, nullable=True)
+    user_id = Column(String, nullable=False)
+    approval_method = Column(String, nullable=False)   # "auto" or "human"
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+```
+
+**Table 3: pipeline_runs**
+```python
+class PipelineRun(Base):
+    __tablename__ = "pipeline_runs"
+    
+    run_id = Column(String, primary_key=True)
+    patient_id = Column(String, ForeignKey("patients.patient_id"), nullable=False, index=True)
+    pipeline_type = Column(String, nullable=False)     # "intake" or "reassessment"
+    status = Column(String, nullable=False, default="queued")  # queued, running, waiting_review, complete, failed
+    user_id = Column(String, nullable=False)
+    s3_key = Column(String, nullable=True)
+    output_pdf_s3_key = Column(String, nullable=True)
+    error = Column(Text, nullable=True)
+    flagged_updates = Column(JSONB, nullable=True)     # stored when status = waiting_review
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+```
+
+Important indexes:
+- audit_trail: index on (patient_id, created_at) for per-patient history queries
+- audit_trail: index on (field_path, created_at) for cross-patient analytics later
+- pipeline_runs: index on (patient_id, created_at) for latest run lookup
 
 ### state.py — Pipeline State
 
@@ -160,7 +237,7 @@ class PipelineState(TypedDict):
     # From parser (intake only)
     raw_pages: Optional[list]
     
-    # Master JSON (loaded from DynamoDB at start of reassessment)
+    # Master JSON (loaded from PostgreSQL at start of reassessment)
     master_json: dict
     
     # From transcription
@@ -211,7 +288,7 @@ class PipelineState(TypedDict):
 - Action: 
   - Validate the s3_key points to a real object in S3 (head_object check)
   - Create a run_id (UUID)
-  - Save initial pipeline status to DynamoDB PipelineState table (status: "queued")
+  - Insert a new row into PostgreSQL pipeline_runs table (status: "queued")
   - Drop a message into SQS: { run_id, patient_id, s3_key, pipeline_type: "intake", user_id }
   - Return immediately — do NOT wait for processing
 - Response: { run_id: str, status: "queued" }
@@ -221,35 +298,35 @@ class PipelineState(TypedDict):
 - Input: { patient_id: str, s3_key: str }
 - Action:
   - Validate the s3_key points to a real object in S3
-  - Verify the patient exists in DynamoDB (they must have completed intake first)
+  - Verify the patient exists in PostgreSQL patients table (they must have completed intake first)
   - Create a run_id (UUID)
-  - Save initial pipeline status to DynamoDB (status: "queued")
+  - Insert a new row into PostgreSQL pipeline_runs table (status: "queued")
   - Drop a message into SQS: { run_id, patient_id, s3_key, pipeline_type: "reassessment", user_id }
   - Return immediately
 - Response: { run_id: str, status: "queued" }
 
 **GET /patient/{patient_id}/status**
 - Auth: required
-- Action: read the latest pipeline run status from DynamoDB PipelineState table
+- Action: query PostgreSQL pipeline_runs table for the latest run for this patient (ORDER BY created_at DESC LIMIT 1)
 - Response: { patient_id, run_id, status, started_at, completed_at, error, has_pending_review }
 
 **GET /review/{patient_id}**
 - Auth: required
-- Action: check if there are flagged items pending review for this patient (look for a pipeline run with status "waiting_review" in DynamoDB)
+- Action: query PostgreSQL pipeline_runs table for a run with status = "waiting_review" for this patient
 - Response: { pending: true/false, run_id, flagged_updates: [...], patient_context: {...} }
 
 **POST /review/{patient_id}**
 - Auth: required
 - Input: { run_id: str, decisions: [{ update_id: str, action: "approve" | "reject" | "edit", edited_value?: any }] }
 - Action: 
-  - Save the decisions to DynamoDB
+  - Save the decisions to PostgreSQL pipeline_runs table (update the flagged_updates JSONB column with decisions)
   - Resume the paused LangGraph pipeline with the human's decisions
   - This triggers the worker to continue processing from where it paused
 - Response: { status: "resumed" }
 
 **GET /get-download-url/{patient_id}**
 - Auth: required
-- Action: find the latest generated PDF S3 key for this patient from DynamoDB, generate a presigned S3 GET URL
+- Action: query PostgreSQL pipeline_runs table for the latest completed run, get the output_pdf_s3_key, generate a presigned S3 GET URL
 - Response: { download_url: str, expires_in: int, generated_at: str }
 - NOTE: FastAPI does NOT stream the file. It returns a URL that Flutter uses to download directly from S3.
 
@@ -264,11 +341,11 @@ This is a separate process that runs alongside FastAPI in the same container (or
 The worker must:
 - Poll SQS using long polling (wait_time_seconds=20 to reduce API calls)
 - When a message arrives, parse the job details (run_id, patient_id, s3_key, pipeline_type, user_id)
-- Update pipeline status in DynamoDB to "running"
+- Update pipeline status in PostgreSQL pipeline_runs table to "running" and set started_at
 - Run the appropriate LangGraph graph (intake or reassessment)
-- On success: update status to "complete", send SNS push notification "PDF is ready"
+- On success: update status to "complete" and set completed_at, send SNS push notification "PDF is ready"
 - On failure: update status to "failed" with error message, send SNS push notification "Processing failed"
-- On human review needed: update status to "waiting_review", send SNS push notification "Review needed"
+- On human review needed: update status to "waiting_review" and store flagged_updates in JSONB column, send SNS push notification "Review needed"
 - Delete the SQS message after successful processing
 - If processing fails, the message returns to the queue after the visibility timeout (for retry)
 - Respect WORKER_CONCURRENCY config — process N jobs at a time using asyncio or threading
@@ -288,14 +365,15 @@ All three use SNS publish() via boto3. The message payload should include enough
 
 Create and export boto3 clients for:
 - s3_client
-- dynamodb_resource (use resource, not client, for simpler DynamoDB operations)
 - sqs_client
 - transcribe_client
 - bedrock_client (bedrock-runtime)
 - sns_client
 - cognito_client (cognito-idp)
 
-All clients should use the region from config.py. In local dev, they should work with AWS credentials from environment or ~/.aws/credentials.
+NOTE: Database operations use SQLAlchemy sessions from database.py, NOT boto3. DynamoDB is not used in this project.
+
+All boto3 clients should use the region from config.py. In local dev, they should work with AWS credentials from environment or ~/.aws/credentials.
 
 ### prompts.py — LLM Prompts
 
@@ -360,6 +438,14 @@ Must dynamically construct the user prompt containing:
 - Return transcript text and segments to the pipeline state
 - Handle errors: job failed, timeout, audio too short, unsupported format
 
+### nodes/load_patient_json.py -Load patient JSON from PostgresSQL
+- This node runs ONLY in the reassessment pipeline (never in intake)
+- Get an async database session from database.py
+- Query: SELECT assessment FROM patients WHERE patient_id = :patient_id
+- If the patient exists: write the assessment JSONB to master_json in state
+- If the patient does NOT exist: raise an error "Patient {patient_id} not found. Complete intake first."
+- Log: "Loaded patient JSON for {patient_id}" (never log the JSON content — PHI)
+
 ### nodes/llm_map.py — Bedrock + Claude Field Mapping
 
 - Load the current patient JSON from state (master_json)
@@ -404,7 +490,8 @@ Must dynamically construct the user prompt containing:
 
 - Check state: if flagged_updates is empty, this node should not have been reached (conditional routing should have skipped it). If somehow reached with empty flagged list, just pass through.
 - If flagged_updates is not empty:
-  - Update pipeline status in DynamoDB to "waiting_review"
+  - Update pipeline status in PostgreSQL pipeline_runs table to "waiting_review"
+  - Store the flagged_updates in the pipeline_runs.flagged_updates JSONB column
   - Call notifications.notify_review_needed() — sends push to caregiver's phone
   - Call LangGraph interrupt() with payload:
     - flagged_updates list
@@ -439,25 +526,28 @@ Must dynamically construct the user prompt containing:
 - Update master_json.document_meta.last_updated_at = current UTC ISO timestamp
 - Write final_json and audit_entries to state
 
-### nodes/save_json.py — Save to DynamoDB
+### nodes/save_json.py — Save to PostgreSQL
 
 - Take master_json (or final_json) from state
-- Write to DynamoDB Patients table:
-  - Key: patient_id
-  - Value: the complete JSON object
-  - Use put_item (full replace) not update_item
-- Handle ConditionalCheckFailedException if you add optimistic locking later
+- Get an async database session from database.py
+- Upsert to PostgreSQL patients table:
+  - Use `INSERT ... ON CONFLICT (patient_id) DO UPDATE SET assessment = :json, updated_at = now(), updated_by = :user_id`
+  - Or use SQLAlchemy `session.merge()` with the Patient model
+  - The assessment column (JSONB) stores the complete patient JSON object
+- Commit the transaction
+- Handle integrity errors gracefully
 
 ### nodes/audit.py — Audit Trail
 
 - Take audit_entries from state
-- Write EACH entry as a separate item to the AuditTrail DynamoDB table:
-  - Partition key: patient_id
-  - Sort key: timestamp (ISO string — ensures chronological ordering)
-  - Include all fields: field_path, old_value, new_value, source_phrase, confidence, user_id, approval_method, run_id
-- NEVER modify or delete existing entries — this table is append-only
-- Also update the pipeline status in PipelineState table to "complete"
-- Set completed_at timestamp
+- Get an async database session from database.py
+- Write EACH entry as a separate row to the PostgreSQL audit_trail table:
+  - Use `session.add_all([AuditEntry(...) for entry in audit_entries])`
+  - Columns: patient_id, run_id, field_path, old_value, new_value, source_phrase, confidence, user_id, approval_method
+  - created_at is auto-set by server_default
+- NEVER update or delete existing rows — this table is append-only
+- Also update the pipeline_runs row: set status = "complete", completed_at = now(), output_pdf_s3_key = the generated PDF path
+- Commit the transaction (audit entries + pipeline status update in one transaction — this is a PostgreSQL advantage)
 
 ### nodes/parse_pdf.py — PLACEHOLDER
 
@@ -495,11 +585,11 @@ load_patient_json → transcribe → llm_map → llm_critic → confidence_check
   → IF flagged_updates is not empty: human_review → merge → generate_pdf → save_json → audit → END
 ```
 
-Note: the reassessment graph starts with a "load_patient_json" node that reads the existing patient JSON from DynamoDB. This is separate from parse_pdf (which is intake-only).
+Note: the reassessment graph starts with a "load_patient_json" node that reads the existing patient JSON from PostgreSQL patients table (SELECT assessment FROM patients WHERE patient_id = :id). This is separate from parse_pdf (which is intake-only).
 
 Both graphs must:
-- Use DynamoDB as the checkpoint backend via langgraph-checkpoint-dynamodb (for crash recovery and interrupt/resume)
-- Have proper error handling: if any node throws an exception, catch it, set status to "failed" with error message, and stop the pipeline
+- Use PostgreSQL as the checkpoint backend via langgraph-checkpoint-postgres (the official, most mature LangGraph checkpointer — for crash recovery and interrupt/resume)
+- Have proper error handling: if any node throws an exception, catch it, set status to "failed" with error message in PostgreSQL pipeline_runs table, and stop the pipeline
 - Log node entry and exit with the run_id for debugging
 - Include the run_id in all state operations so pipeline runs are traceable
 
@@ -609,11 +699,12 @@ Must include:
 ### Dockerfile
 
 - Base image: python:3.11-slim
-- Install system dependencies: only what FastAPI and boto3 need (no WeasyPrint — that's the other team's concern)
+- Install system dependencies: only what FastAPI, asyncpg, and boto3 need (no WeasyPrint — that's the other team's concern)
+- Install postgresql-client (needed for asyncpg to connect to PostgreSQL)
 - Copy requirements.txt and pip install
 - Copy application code
 - Expose port 8080
-- CMD: start BOTH the FastAPI server AND the SQS worker. Use a process manager like supervisord, or a simple shell script that runs both:
+- CMD: start BOTH the FastAPI server AND the SQS worker. Use a simple shell script:
   ```
   uvicorn main:app --host 0.0.0.0 --port 8080 &
   python worker.py &
@@ -627,6 +718,10 @@ fastapi>=0.110.0
 uvicorn[standard]>=0.29.0
 langgraph>=0.2.0
 langchain-core>=0.2.0
+langgraph-checkpoint-postgres>=2.0.0
+sqlalchemy[asyncio]>=2.0.0
+asyncpg>=0.29.0
+alembic>=1.13.0
 boto3>=1.34.0
 pydantic>=2.6.0
 python-multipart>=0.0.9
@@ -641,7 +736,8 @@ moto[all]>=5.0.0
 ### tests/
 
 - Use pytest with pytest-asyncio for async tests
-- Mock all AWS services using moto (S3, DynamoDB, SQS, etc.)
+- Mock all AWS services using moto (S3, SQS, etc.)
+- Use a test PostgreSQL database (create a samni_test database, or use testcontainers-python to spin up a temporary PostgreSQL in Docker for tests)
 - test_dictations.json should contain 30+ test sentences covering:
   - Mobility changes ("he can't walk anymore, needs the Hoyer now")
   - Bathing changes ("totally dependent for bathing, bed bath twice a week")
@@ -667,33 +763,35 @@ Each test case should have:
 Build the project in this exact order. Complete each step before moving to the next.
 
 1. **config.py** and **aws_clients.py** — everything depends on these
-2. **state.py** and **models.py** — define all data structures
-3. **utils.py** — get_nested, set_nested, and other helpers
-4. **auth.py** — Cognito middleware (with dev bypass for testing)
-5. **prompts.py** — all LLM prompts for Claude
-6. **notifications.py** — SNS push notification helper
-7. **nodes/** — build each node one at a time, test independently:
+2. **database.py** and **db_models.py** — SQLAlchemy engine, session, and table models
+3. **alembic init** — set up Alembic, create initial migration that generates all 3 tables
+4. **state.py** and **models.py** — define pipeline state and Pydantic models
+5. **utils.py** — get_nested, set_nested, and other helpers
+6. **auth.py** — Cognito middleware (with dev bypass for testing)
+7. **prompts.py** — all LLM prompts for Claude
+8. **notifications.py** — SNS push notification helper
+9. **nodes/** — build each node one at a time, test independently:
    - Start with **merge.py** (pure Python, no AWS calls, easiest to test)
    - Then **confidence.py** (pure Python logic)
-   - Then **save_json.py** and **audit.py** (DynamoDB writes)
+   - Then **save_json.py** and **audit.py** (PostgreSQL operations via SQLAlchemy)
    - Then **transcribe.py** (Transcribe Medical API)
    - Then **llm_map.py** and **llm_critic.py** (Bedrock API)
    - Then **human_review.py** (LangGraph interrupt)
    - **parse_pdf.py** and **generate_pdf.py** are PLACEHOLDERS — just return mock data
-8. **pipeline.py** — wire all nodes into the two LangGraph graphs
-9. **worker.py** — SQS background worker that runs pipelines
-10. **main.py** — wire FastAPI endpoints (presigned URLs, intake, reassessment, review, download, status, health)
-11. **Dockerfile** — containerize (runs both FastAPI and worker)
-12. **tests/** — write tests for each component
-13. **.env.example** and **README.md** — documentation
+10. **pipeline.py** — wire all nodes into the two LangGraph graphs with PostgreSQL checkpoint backend
+11. **worker.py** — SQS background worker that runs pipelines
+12. **main.py** — wire FastAPI endpoints (presigned URLs, intake, reassessment, review, download, status, health)
+13. **Dockerfile** — containerize (runs both FastAPI and worker)
+14. **tests/** — write tests for each component
+15. **.env.example** and **README.md** — documentation
 
-Start with step 1. Create config.py and aws_clients.py. Show me the complete code for both files. Then wait for my confirmation before proceeding to step 2.
+Start with step 1. Create config.py and aws_clients.py. Show me the complete production-ready code for both files. Then wait for my confirmation before proceeding to step 2.
 
 ---
 
 ## HOW TO USE THIS PROMPT
 
-### Step 1: Paste PART 1 (from "Role" to "Architecture Decisions" including Key Rules)
+### Step 1: Paste PART 1 (from "Role" to "Architecture Decisions" including Key Rules and both IMPORTANT sections)
 Say: "Acknowledge you understand this context. Don't write any code yet."
 
 ### Step 2: Paste PART 2 (from "Project Structure" to end of "Detailed Specifications")
