@@ -36,7 +36,7 @@ import json
 from datetime import datetime
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 # --------------------------------------------------------------------------- #
@@ -412,6 +412,20 @@ class SQSMessage(_BaseModel):
     downstream action. Any attacker (or misbehaving internal service) with
     SQS:SendMessage on the queue must not be able to pivot into arbitrary
     DB writes — rigorous validation here is the gate.
+
+    Two flavours of message travel on the queue:
+
+      * Fresh run (`resume=False`, default): the worker builds a new
+        `PipelineState` and invokes the graph from START. `decisions`
+        MUST be None.
+      * Resume (`resume=True`): the worker loads the checkpointed graph
+        and resumes it with `Command(resume={"decisions": ...})`.
+        `decisions` MUST be a non-empty list; `pipeline_type` MUST be
+        'reassessment' because intake has no human-review interrupt.
+
+    The two shapes are cross-checked by a model-level validator so an
+    inconsistent body (e.g. `resume=True` with no decisions) is refused
+    at the boundary rather than halfway through the worker.
     """
 
     run_id: str = Field(..., pattern=RUN_ID_PATTERN)
@@ -428,11 +442,44 @@ class SQSMessage(_BaseModel):
     )
     pipeline_type: PipelineType
     user_id: str = Field(..., min_length=1, max_length=USER_ID_MAX_LEN)
+    resume: bool = Field(
+        default=False,
+        description=(
+            "When True, the worker resumes a paused graph via "
+            "Command(resume=...). When False, the worker starts a fresh run."
+        ),
+    )
+    decisions: Optional[list[ReviewDecision]] = Field(
+        default=None,
+        max_length=MAX_DECISIONS_PER_SUBMISSION,
+        description=(
+            "Caregiver decisions to feed into the resumed graph. Required "
+            "and non-empty when resume=True; forbidden when resume=False."
+        ),
+    )
 
     @field_validator("s3_key")
     @classmethod
     def _check_s3_key(cls, v: str) -> str:
         return _validate_s3_key(v)
+
+    @model_validator(mode="after")
+    def _check_resume_consistency(self) -> "SQSMessage":
+        if self.resume:
+            if self.pipeline_type != "reassessment":
+                raise ValueError(
+                    "resume messages must have pipeline_type='reassessment'"
+                )
+            if not self.decisions:
+                raise ValueError(
+                    "resume messages must carry a non-empty decisions list"
+                )
+        else:
+            if self.decisions is not None:
+                raise ValueError(
+                    "decisions are only allowed on resume messages"
+                )
+        return self
 
 
 __all__ = [

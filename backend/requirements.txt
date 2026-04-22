@@ -1,0 +1,167 @@
+# =============================================================================
+# Samni Labs backend — Python dependencies
+# =============================================================================
+#
+# Pinning policy:
+#   * EXACT pins (==) for every runtime dependency. This image ships PHI-
+#     adjacent code; we do not want a transitive version bump on a `docker
+#     build` to change behaviour between the last test run and production.
+#   * The CI pipeline runs `pip-audit` against this file on every PR. A
+#     new CVE on a pinned version blocks merge until the pin is moved.
+#   * Upgrades are deliberate: one PR per package, with a note in the PR
+#     body explaining what changed. No blanket `pip install -U`.
+#
+# Install strategy in the Dockerfile:
+#   * `pip install --no-cache-dir -r requirements.txt` inside the builder
+#     stage's /opt/venv. The runtime stage copies /opt/venv forward and
+#     never re-runs pip. This means:
+#       - No pip cache in the final image.
+#       - No network access required at container startup.
+#       - The exact versions in this file are the versions in production.
+#
+# Local development:
+#   * `pip install -r requirements.txt -r requirements-dev.txt` in a
+#     venv (Python 3.11). Dev deps live in a separate file so they
+#     never reach the production image.
+#
+# Grouping below follows the layering used by the app itself: web ->
+# data -> messaging/AWS -> LLM pipeline -> auth -> utilities.
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# Web framework (FastAPI + Uvicorn)
+# -----------------------------------------------------------------------------
+# FastAPI provides the ASGI app, dependency injection, OpenAPI schema,
+# and the starlette-based middleware surface used by main.py's trace-id
+# and secure-headers middleware. Version 0.115 series is the current
+# stable line with Pydantic v2 support.
+fastapi==0.115.6
+
+# Uvicorn is the ASGI server. `[standard]` pulls in httptools + uvloop
+# on Linux (faster event loop + parser) and websockets support. The
+# Dockerfile CMD invokes uvicorn directly.
+uvicorn[standard]==0.32.1
+
+# Starlette is pinned transitively by FastAPI, but we pin it explicitly
+# so `pip-audit` can key CVEs against a known version and the dep
+# resolver never picks an unexpected patch.
+starlette==0.41.3
+
+
+# -----------------------------------------------------------------------------
+# Data validation (Pydantic v2)
+# -----------------------------------------------------------------------------
+# Pydantic v2 powers every request/response model and the SQSMessage
+# schema (models.py). The `model_validator` used for the resume/decisions
+# consistency check requires v2.4+.
+pydantic==2.10.3
+
+# pydantic-settings is the v2 replacement for BaseSettings. config.py's
+# Settings class depends on it for .env loading and env-var coercion.
+pydantic-settings==2.7.0
+
+
+# -----------------------------------------------------------------------------
+# Database (SQLAlchemy 2.x async + asyncpg + Alembic)
+# -----------------------------------------------------------------------------
+# SQLAlchemy 2.0 is the ORM and Core used across db_models, database,
+# and every data-access path. The 2.x line is required for the `Mapped`
+# / `mapped_column` typing used in db_models.py.
+SQLAlchemy==2.0.36
+
+# asyncpg is the driver behind the `postgresql+asyncpg://` DSN. It is
+# significantly faster than psycopg for async workloads and is the
+# recommended driver for SQLAlchemy async.
+asyncpg==0.30.0
+
+# psycopg3 is used by the LangGraph checkpointer (`langgraph-checkpoint-
+# postgres` uses psycopg, not asyncpg) and by Alembic's sync DSN.
+# `[binary]` ships a prebuilt libpq so the runtime image does not
+# need libpq build headers. `[pool]` is kept as an explicit extra
+# even though we also pin psycopg-pool below, so `pip install` never
+# installs a mismatched pair.
+psycopg[binary,pool]==3.2.3
+
+# psycopg-pool provides AsyncConnectionPool, used by pipeline.py to
+# manage checkpointer connections. Pinned explicitly (not just via the
+# [pool] extra) so CVE tracking has a concrete version key.
+psycopg-pool==3.2.4
+
+# Alembic runs all schema migrations. The sync DSN (DATABASE_URL_SYNC)
+# is used here and nowhere else.
+alembic==1.14.0
+
+
+# -----------------------------------------------------------------------------
+# LangGraph (pipeline + checkpointer)
+# -----------------------------------------------------------------------------
+# LangGraph is the pipeline engine. pipeline.py builds two StateGraphs
+# (intake, reassessment) and compiles each with a shared checkpointer.
+# The 0.2.x series is API-stable for StateGraph / interrupt / Command.
+langgraph==0.2.61
+
+# The postgres checkpointer persists every state transition. Must be
+# version-compatible with langgraph itself; 2.x pairs with langgraph
+# 0.2.x.
+langgraph-checkpoint-postgres==2.0.13
+
+# langgraph-checkpoint is the abstract interface; pinned to match the
+# postgres implementation so the dep resolver does not pick a newer
+# interface that the postgres backend has not caught up with.
+langgraph-checkpoint==2.0.10
+
+
+# -----------------------------------------------------------------------------
+# AWS SDK (boto3 / botocore)
+# -----------------------------------------------------------------------------
+# boto3 is used for S3 (PHI storage + presigned URLs), SQS (work
+# queue), SNS (caregiver notifications), Bedrock Runtime (Claude), and
+# Transcribe Medical. botocore is pinned to match boto3's expected
+# range — a mismatched pair breaks `Config` signature resolution.
+#
+# SECURITY: boto3 never reads credentials from this file or the image.
+# Runtime credentials come from the IAM task role attached by the
+# orchestrator (ECS / EKS / EC2 instance profile).
+boto3==1.35.83
+botocore==1.35.83
+
+
+# -----------------------------------------------------------------------------
+# Authentication (Cognito JWT)
+# -----------------------------------------------------------------------------
+# python-jose verifies Cognito JWTs with RS256. `[cryptography]`
+# installs the `cryptography` backend rather than the pure-python
+# pycryptodome one; the cryptography backend is maintained, audited,
+# and noticeably faster on signature verification.
+python-jose[cryptography]==3.3.0
+
+# cryptography is pinned explicitly (not just via the python-jose
+# extra) so CVE tracking has a concrete version. cryptography has had
+# several high-severity CVEs over the last two years; keep this tight.
+cryptography==44.0.0
+
+# cachetools backs the Cognito JWKS TTLCache in auth.py. The cache TTL
+# is configurable via COGNITO_JWKS_CACHE_TTL.
+cachetools==5.5.0
+
+# httpx is the async HTTP client used by auth.py to fetch the Cognito
+# JWKS document. The close_http_client() teardown in main.py's lifespan
+# closes the shared client on shutdown.
+httpx==0.28.1
+
+
+# -----------------------------------------------------------------------------
+# Runtime utilities
+# -----------------------------------------------------------------------------
+# python-multipart is required by FastAPI to parse multipart/form-data
+# bodies. The current API endpoints do not accept file uploads (files
+# go direct-to-S3 via presigned URLs), but FastAPI will emit a warning
+# at startup without this package installed; shipping it silences the
+# warning and future-proofs against adding a multipart endpoint.
+python-multipart==0.0.20
+
+# orjson is used indirectly by FastAPI for its fastest JSON path when
+# `ORJSONResponse` is requested. Pinned here so the dep resolver does
+# not pick a newer major.
+orjson==3.10.12

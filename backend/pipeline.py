@@ -74,9 +74,9 @@ from state import PipelineState
 logger = logging.getLogger(__name__)
 
 
-# --------------------------------------------------------------------------- #
+
 # Module state (guarded by an asyncio.Lock)
-# --------------------------------------------------------------------------- #
+
 _init_lock: Final[asyncio.Lock] = asyncio.Lock()
 _pool: Optional[AsyncConnectionPool] = None
 _checkpointer: Optional[AsyncPostgresSaver] = None
@@ -84,9 +84,9 @@ _intake_graph: Optional[Any] = None
 _reassessment_graph: Optional[Any] = None
 
 
-# --------------------------------------------------------------------------- #
+
 # DSN conversion for the checkpointer (psycopg, not asyncpg)
-# --------------------------------------------------------------------------- #
+
 def _to_psycopg_dsn(sqlalchemy_dsn: str) -> str:
     """
     Convert `postgresql+asyncpg://...` (SQLAlchemy) to a plain
@@ -125,9 +125,9 @@ def _safe_dsn_host(dsn: str) -> str:
         return "<unknown>"
 
 
-# --------------------------------------------------------------------------- #
+
 # Graph construction (pure, no side effects)
-# --------------------------------------------------------------------------- #
+
 def _route_after_confidence(state: PipelineState) -> str:
     """
     Conditional edge: after confidence routing, send through
@@ -207,9 +207,9 @@ def _build_reassessment_graph() -> StateGraph:
     return graph
 
 
-# --------------------------------------------------------------------------- #
+
 # Lifecycle
-# --------------------------------------------------------------------------- #
+
 async def init_pipeline() -> None:
     """
     One-time pipeline setup: open the checkpoint-DB connection pool,
@@ -321,9 +321,8 @@ def get_graph_for(pipeline_type: str) -> Any:
     raise ValueError(f"unknown pipeline_type: {pipeline_type!r}")
 
 
-# --------------------------------------------------------------------------- #
 # Config builder
-# --------------------------------------------------------------------------- #
+
 def run_config(run_id: str) -> dict[str, Any]:
     """
     Build the LangGraph config dict keyed by `run_id`. LangGraph
