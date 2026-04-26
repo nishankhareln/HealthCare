@@ -61,8 +61,13 @@ from database import Base
 # Enum-like domain constants (mirrored in Pydantic models and CHECK constraints)
 # --------------------------------------------------------------------------- #
 PIPELINE_TYPE_INTAKE = "intake"
+PIPELINE_TYPE_INTAKE_DOCTOR = "intake_doctor"
 PIPELINE_TYPE_REASSESSMENT = "reassessment"
-PIPELINE_TYPES: tuple[str, ...] = (PIPELINE_TYPE_INTAKE, PIPELINE_TYPE_REASSESSMENT)
+PIPELINE_TYPES: tuple[str, ...] = (
+    PIPELINE_TYPE_INTAKE,
+    PIPELINE_TYPE_INTAKE_DOCTOR,
+    PIPELINE_TYPE_REASSESSMENT,
+)
 
 PIPELINE_STATUS_QUEUED = "queued"
 PIPELINE_STATUS_RUNNING = "running"
@@ -96,6 +101,67 @@ def _sql_in_list(values: tuple[str, ...]) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# users — single-tenant login table
+# --------------------------------------------------------------------------- #
+class User(Base):
+    """
+    Application user (caregiver). Single-tenant deployment — every user
+    belongs to the same organization, so we deliberately do NOT carry a
+    role or a facility column. Add them later if multi-tenancy lands.
+
+    INVARIANTS:
+      * `password_hash` is ALWAYS a bcrypt hash. Application code never
+        writes plain text here, and the API never returns it on any
+        endpoint.
+      * `username` is the only field used to look the row up at login
+        time; case-sensitive, must be unique.
+    """
+
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(
+        String(64),
+        primary_key=True,
+    )
+    username: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    password_hash: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    last_login_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "length(username) > 0",
+            name="ck_users_username_nonempty",
+        ),
+        CheckConstraint(
+            "length(password_hash) > 0",
+            name="ck_users_password_hash_nonempty",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        # Deliberately does NOT include `password_hash`. Even though it
+        # is hashed, leaving it out of repr means a stray log line will
+        # never show it — defense in depth.
+        return f"<User id={self.id!r} username={self.username!r}>"
+
+
+# --------------------------------------------------------------------------- #
 # patients
 # --------------------------------------------------------------------------- #
 class Patient(Base):
@@ -109,9 +175,18 @@ class Patient(Base):
 
     __tablename__ = "patients"
 
+    # Washington-state ACES ID (Automated Client Eligibility System) —
+    # 9-digit numeric string. Stored as text rather than integer because
+    # ACES IDs are formatted (leading zeros are significant).
     patient_id: Mapped[str] = mapped_column(
-        String(64),
+        String(9),
         primary_key=True,
+    )
+    # Display / preferred name for UI lists. Not the legal name from the
+    # assessment JSON (that lives in `assessment.demographics.client_name`).
+    preferred_name: Mapped[Optional[str]] = mapped_column(
+        String(128),
+        nullable=True,
     )
     facility_id: Mapped[Optional[str]] = mapped_column(
         String(64),
@@ -136,11 +211,27 @@ class Patient(Base):
         String(128),
         nullable=True,
     )
+    # Soft-delete marker. Non-null means the patient is archived and
+    # should be hidden from list/detail endpoints (HIPAA forbids hard
+    # deletes). All historical audit_trail and pipeline_runs rows
+    # remain intact.
+    archived_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    # Identifier of the Flutter-bundled template version that matches this
+    # patient's assessment shape. Populated when the caregiver uploads a
+    # signed PDF; used for forensic regeneration ("render the exact plan
+    # that was signed on date X").
+    template_version: Mapped[Optional[str]] = mapped_column(
+        String(64),
+        nullable=True,
+    )
 
     __table_args__ = (
         CheckConstraint(
-            "length(patient_id) > 0",
-            name="ck_patients_patient_id_nonempty",
+            r"patient_id ~ '^[0-9]{9}$'",
+            name="ck_patients_patient_id_aces_format",
         ),
     )
 
@@ -330,6 +421,18 @@ class PipelineRun(Base):
     )
     output_pdf_s3_key: Mapped[Optional[str]] = mapped_column(
         String(1024),
+        nullable=True,
+    )
+    # Signed PDF uploaded by Flutter after the caregiver signs on-device.
+    # The backend never generates PDFs — rendering happens in the app from
+    # the patient JSON + the bundled WAC-388-76-615 template. This field
+    # stores the S3 key of the signed archive artifact for that run.
+    signed_pdf_s3_key: Mapped[Optional[str]] = mapped_column(
+        String(1024),
+        nullable=True,
+    )
+    signed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
         nullable=True,
     )
     error: Mapped[Optional[str]] = mapped_column(

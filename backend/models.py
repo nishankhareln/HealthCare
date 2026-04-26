@@ -42,9 +42,9 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 # --------------------------------------------------------------------------- #
 # Literal enums (mirror db_models CHECK constraints)
 # --------------------------------------------------------------------------- #
-FileType = Literal["pdf", "audio"]
+FileType = Literal["pdf", "audio", "signed_pdf"]
 ReviewAction = Literal["approve", "reject", "edit"]
-PipelineType = Literal["intake", "reassessment"]
+PipelineType = Literal["intake", "intake_doctor", "reassessment"]
 PipelineStatus = Literal[
     "queued", "running", "waiting_review", "complete", "failed"
 ]
@@ -57,8 +57,8 @@ ApprovalMethod = Literal["auto", "human"]
 # Identifiers: alphanumeric, hyphen, underscore; must start with alphanumeric.
 # 1-64 characters. Strict enough to rule out path-segment smuggling, loose
 # enough to accept UUIDs, Cognito sub claims, and facility-local IDs.
-PATIENT_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"
-PATIENT_ID_MAX_LEN = 64
+PATIENT_ID_PATTERN = r"^\d{9}$"
+PATIENT_ID_MAX_LEN = 9
 
 # UUID v4 format (8-4-4-4-12 hex). Our own code only produces UUIDs, so we
 # reject anything else at the boundary.
@@ -84,6 +84,7 @@ S3_KEY_ALLOWED_PREFIXES: tuple[str, ...] = (
     "audio/",
     "transcripts/",
     "pdfs/",
+    "signed/",
 )
 
 # Bounds on review submission
@@ -222,8 +223,153 @@ class IntakeRequest(_BaseModel):
         return _validate_s3_key(v)
 
 
+# --------------------------------------------------------------------------- #
+# Patient CRUD
+# --------------------------------------------------------------------------- #
+class PatientCreateRequest(_BaseModel):
+    """
+    POST /patients body.
+
+    Caregiver creates a new patient by entering the ACES ID + preferred
+    name. The full assessment JSON is populated later by an /intake run
+    or by /reassessment dictations. We accept an empty assessment shell
+    here on purpose — it lets the patient appear on the home-screen list
+    before any documents have been uploaded.
+    """
+
+    patient_id: str = Field(
+        ...,
+        min_length=PATIENT_ID_MAX_LEN,
+        max_length=PATIENT_ID_MAX_LEN,
+        pattern=PATIENT_ID_PATTERN,
+        description="9-digit Washington ACES ID (e.g. '000333000').",
+    )
+    preferred_name: Optional[str] = Field(
+        default=None,
+        max_length=128,
+        description="Display name for UI lists. Not the legal name.",
+    )
+    facility_id: Optional[str] = Field(
+        default=None,
+        max_length=64,
+        description="Facility this patient belongs to. Defaults to caller's.",
+    )
+
+
+class PatientPatchRequest(_BaseModel):
+    """
+    PATCH /patients/{patient_id} body.
+
+    Partial update to the assessment JSON. `assessment_patch` is a flat
+    dict of `dotted.field.path -> new_value`, intentionally identical to
+    the format used by the /review endpoint — every changed field is
+    audited.
+
+    `preferred_name` and `facility_id` can be updated independently; they
+    are NOT inside the assessment JSON.
+    """
+
+    preferred_name: Optional[str] = Field(default=None, max_length=128)
+    facility_id: Optional[str] = Field(default=None, max_length=64)
+    assessment_patch: Optional[dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Flat map of dotted field paths to new values. "
+            "e.g. {'demographics.dob': '5/9/1965'}"
+        ),
+    )
+
+    @field_validator("assessment_patch")
+    @classmethod
+    def _check_patch(cls, value: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        if value is None:
+            return value
+        if len(value) == 0:
+            raise ValueError("assessment_patch must not be empty")
+        if len(value) > MAX_DECISIONS_PER_SUBMISSION:
+            raise ValueError(
+                f"assessment_patch must have at most "
+                f"{MAX_DECISIONS_PER_SUBMISSION} entries"
+            )
+        for path, new_val in value.items():
+            if not isinstance(path, str) or not path:
+                raise ValueError("assessment_patch keys must be non-empty strings")
+            if len(path) > FIELD_PATH_MAX_LEN:
+                raise ValueError(
+                    f"assessment_patch key exceeds {FIELD_PATH_MAX_LEN} chars"
+                )
+            if ".." in path or path.startswith(".") or path.endswith("."):
+                raise ValueError(
+                    "assessment_patch keys must be valid dotted paths"
+                )
+            _validate_edited_value(new_val)
+        return value
+
+
+class PatientListItem(_BaseModel):
+    """One row in the GET /patients list response. Slim — no full JSON."""
+
+    patient_id: str
+    preferred_name: Optional[str] = None
+    facility_id: Optional[str] = None
+    updated_at: Optional[datetime] = None
+    latest_run_status: Optional[str] = None
+
+
+class PatientListResponse(_BaseModel):
+    """GET /patients response — paginated list of patients."""
+
+    items: list[PatientListItem]
+    total: int
+    limit: int
+    offset: int
+
+
+class PatientDetailResponse(_BaseModel):
+    """GET /patients/{patient_id} response — full record."""
+
+    patient_id: str
+    preferred_name: Optional[str] = None
+    facility_id: Optional[str] = None
+    assessment: dict[str, Any]
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    updated_by: Optional[str] = None
+    template_version: Optional[str] = None
+
+
+class AuthMeResponse(_BaseModel):
+    """GET /auth/me response — the authenticated caller, for UI display."""
+
+    id: str
+    username: str
+
+
+class LoginRequest(_BaseModel):
+    """POST /auth/login body."""
+
+    username: str = Field(..., min_length=1, max_length=64)
+    password: str = Field(..., min_length=1, max_length=1024)
+
+
+class LoginResponse(_BaseModel):
+    """POST /auth/login response."""
+
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int = Field(..., description="Token lifetime in seconds.")
+    user: AuthMeResponse
+
+
 class ReassessmentRequest(_BaseModel):
-    """POST /reassessment request body."""
+    """
+    POST /reassessment request body.
+
+    Flutter records the dictation on-device and uploads the audio file
+    to S3 under the `audio/` prefix. The backend's transcribe node then
+    calls Amazon Transcribe Medical against that S3 object. Only the
+    audio S3 key travels through this endpoint.
+    """
 
     patient_id: str = Field(
         ...,
@@ -231,16 +377,60 @@ class ReassessmentRequest(_BaseModel):
         max_length=PATIENT_ID_MAX_LEN,
         pattern=PATIENT_ID_PATTERN,
     )
+    audio_s3_key: str = Field(
+        ...,
+        min_length=1,
+        max_length=S3_KEY_MAX_LEN,
+        description=(
+            "S3 key of the Flutter-uploaded audio file. Must start "
+            "with 'audio/'."
+        ),
+    )
+
+    @field_validator("audio_s3_key")
+    @classmethod
+    def _check_audio_s3_key(cls, v: str) -> str:
+        v = _validate_s3_key(v)
+        if not v.startswith("audio/"):
+            raise ValueError("audio_s3_key must start with 'audio/'")
+        return v
+
+
+class SignedPdfRequest(_BaseModel):
+    """
+    POST /signed-pdf/{run_id} request body.
+
+    Flutter fills + signs the care-plan template on-device, then uploads the
+    rendered PDF to S3 via a presigned URL (upload_type='signed_pdf'), then
+    calls this endpoint with the returned S3 key. The backend stores the key
+    on the corresponding pipeline_runs row — it becomes the legal archive
+    artifact for that run.
+    """
+
     s3_key: str = Field(
         ...,
         min_length=1,
         max_length=S3_KEY_MAX_LEN,
+        description="S3 key of the signed PDF. Must start with 'signed/'.",
+    )
+    template_version: str = Field(
+        ...,
+        min_length=1,
+        max_length=64,
+        description=(
+            "Identifier of the Flutter-bundled template version used to render "
+            "this signed PDF (e.g. 'WAC-388-76-615-v2024'). Stored so any "
+            "regeneration can pick the exact same template."
+        ),
     )
 
     @field_validator("s3_key")
     @classmethod
     def _check_s3_key(cls, v: str) -> str:
-        return _validate_s3_key(v)
+        v = _validate_s3_key(v)
+        if not v.startswith("signed/"):
+            raise ValueError("s3_key must start with 'signed/' for signed PDFs")
+        return v
 
 
 class ReviewDecision(_BaseModel):
@@ -502,6 +692,15 @@ __all__ = [
     "UploadUrlRequest",
     "IntakeRequest",
     "ReassessmentRequest",
+    "PatientCreateRequest",
+    "PatientPatchRequest",
+    "PatientListItem",
+    "PatientListResponse",
+    "PatientDetailResponse",
+    "AuthMeResponse",
+    "LoginRequest",
+    "LoginResponse",
+    "SignedPdfRequest",
     "ReviewDecision",
     "ReviewSubmission",
     # Responses

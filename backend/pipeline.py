@@ -3,10 +3,23 @@ LangGraph pipeline construction + checkpointer wiring.
 
 Two graphs:
 
-    INTAKE         START → parse_pdf → save_json → audit → generate_pdf → END
-    REASSESSMENT   START → load_patient_json → transcribe → llm_map →
-                    llm_critic → confidence → human_review → merge →
-                    save_json → audit → generate_pdf → END
+    INTAKE          START → parse_pdf → save_json → audit → END
+    INTAKE_DOCTOR   START → parse_doctor_pdf → save_json → audit → END
+    REASSESSMENT    START → load_patient_json → transcribe → llm_map →
+                     llm_critic → confidence → human_review → merge →
+                     save_json → audit → END
+
+    Audio handling: Flutter records the dictation on-device and uploads
+    the audio file to S3 (`audio/` prefix). The `transcribe` node calls
+    Amazon Transcribe Medical's async batch API against that S3 object
+    and stores the resulting transcript at `transcripts/{run_id}.json`.
+    The transcript text is then placed on `state.transcript` for
+    `llm_map` to consume.
+
+    PDF rendering is NOT a backend step. The Flutter app holds the fixed
+    WAC-388-76-615 Negotiated Care Plan template, renders it locally
+    from the patient JSON, and uploads the signed PDF back to S3 via
+    POST /signed-pdf/{run_id}.
 
 Both graphs share a single PostgreSQL checkpointer (AsyncPostgresSaver
 from `langgraph-checkpoint-postgres`). The checkpointer persists every
@@ -57,15 +70,19 @@ from langgraph.graph import END, START, StateGraph
 from psycopg_pool import AsyncConnectionPool
 
 from config import get_settings
-from db_models import PIPELINE_TYPE_INTAKE, PIPELINE_TYPE_REASSESSMENT
+from db_models import (
+    PIPELINE_TYPE_INTAKE,
+    PIPELINE_TYPE_INTAKE_DOCTOR,
+    PIPELINE_TYPE_REASSESSMENT,
+)
 from nodes.audit import audit_node
 from nodes.confidence import confidence_node
-from nodes.generate_pdf import generate_pdf_node
 from nodes.human_review import human_review_node
 from nodes.llm_critic import llm_critic_node
 from nodes.llm_map import llm_map_node
 from nodes.load_patient_json import load_patient_json_node
 from nodes.merge import merge_node
+from nodes.parse_doctor_pdf import parse_doctor_pdf_node
 from nodes.parse_pdf import parse_pdf_node
 from nodes.save_json import save_json_node
 from nodes.transcribe import transcribe_node
@@ -81,6 +98,7 @@ _init_lock: Final[asyncio.Lock] = asyncio.Lock()
 _pool: Optional[AsyncConnectionPool] = None
 _checkpointer: Optional[AsyncPostgresSaver] = None
 _intake_graph: Optional[Any] = None
+_doctor_intake_graph: Optional[Any] = None
 _reassessment_graph: Optional[Any] = None
 
 
@@ -146,21 +164,54 @@ def _route_after_confidence(state: PipelineState) -> str:
 
 def _build_intake_graph() -> StateGraph:
     """
-    Build the INTAKE graph.
+    Build the INTAKE graph (caregiver-uploaded 36-page DSHS Assessment
+    Details PDF).
 
-        parse_pdf → save_json → audit → generate_pdf → END
+        parse_pdf → save_json → audit → END
+
+    Owns demographics, mobility, ADLs, behaviors, social — the
+    non-medical portion of the assessment.
+
+    PDF generation is deliberately NOT a backend step. The Flutter app holds
+    the WAC-388-76-615 Negotiated Care Plan template, renders it locally
+    from the patient JSON, captures the caregiver's signature, and uploads
+    the signed PDF back to S3 (see POST /signed-pdf/{run_id}).
     """
     graph = StateGraph(PipelineState)
     graph.add_node("parse_pdf", parse_pdf_node)
     graph.add_node("save_json", save_json_node)
     graph.add_node("audit", audit_node)
-    graph.add_node("generate_pdf", generate_pdf_node)
 
     graph.add_edge(START, "parse_pdf")
     graph.add_edge("parse_pdf", "save_json")
     graph.add_edge("save_json", "audit")
-    graph.add_edge("audit", "generate_pdf")
-    graph.add_edge("generate_pdf", END)
+    graph.add_edge("audit", END)
+
+    return graph
+
+
+def _build_doctor_intake_graph() -> StateGraph:
+    """
+    Build the DOCTOR INTAKE graph (doctor-supplied ~15-page PDF that
+    covers diseases, diagnoses, medications, conditions).
+
+        parse_doctor_pdf → save_json → audit → END
+
+    Same shape as the regular intake graph, but the parse node runs a
+    doctor-PDF-specific Bedrock prompt that extracts ONLY the medical
+    sections of the assessment and merges them into the existing
+    patient JSON. Caregiver-owned fields (mobility, ADLs, etc.) are
+    preserved verbatim.
+    """
+    graph = StateGraph(PipelineState)
+    graph.add_node("parse_doctor_pdf", parse_doctor_pdf_node)
+    graph.add_node("save_json", save_json_node)
+    graph.add_node("audit", audit_node)
+
+    graph.add_edge(START, "parse_doctor_pdf")
+    graph.add_edge("parse_doctor_pdf", "save_json")
+    graph.add_edge("save_json", "audit")
+    graph.add_edge("audit", END)
 
     return graph
 
@@ -170,8 +221,15 @@ def _build_reassessment_graph() -> StateGraph:
     Build the REASSESSMENT graph.
 
         load_patient_json → transcribe → llm_map → llm_critic →
-        confidence → (human_review?) → merge → save_json → audit →
-        generate_pdf → END
+        confidence → (human_review?) → merge → save_json → audit → END
+
+    Transcription runs on the backend via Amazon Transcribe Medical's
+    async batch API. Flutter uploads the audio file to S3, the worker
+    invokes this graph, and the `transcribe` node turns that audio into
+    text inside `state.transcript`.
+
+    As with intake, the backend does not render the final PDF — Flutter
+    renders it from the merged JSON and uploads the signed artifact back.
     """
     graph = StateGraph(PipelineState)
     graph.add_node("load_patient_json", load_patient_json_node)
@@ -183,7 +241,6 @@ def _build_reassessment_graph() -> StateGraph:
     graph.add_node("merge", merge_node)
     graph.add_node("save_json", save_json_node)
     graph.add_node("audit", audit_node)
-    graph.add_node("generate_pdf", generate_pdf_node)
 
     graph.add_edge(START, "load_patient_json")
     graph.add_edge("load_patient_json", "transcribe")
@@ -201,8 +258,7 @@ def _build_reassessment_graph() -> StateGraph:
     graph.add_edge("human_review", "merge")
     graph.add_edge("merge", "save_json")
     graph.add_edge("save_json", "audit")
-    graph.add_edge("audit", "generate_pdf")
-    graph.add_edge("generate_pdf", END)
+    graph.add_edge("audit", END)
 
     return graph
 
@@ -217,10 +273,14 @@ async def init_pipeline() -> None:
 
     Safe to call multiple times; subsequent calls are no-ops.
     """
-    global _pool, _checkpointer, _intake_graph, _reassessment_graph
+    global _pool, _checkpointer, _intake_graph, _doctor_intake_graph, _reassessment_graph
 
     async with _init_lock:
-        if _intake_graph is not None and _reassessment_graph is not None:
+        if (
+            _intake_graph is not None
+            and _doctor_intake_graph is not None
+            and _reassessment_graph is not None
+        ):
             return
 
         settings = get_settings()
@@ -257,6 +317,9 @@ async def init_pipeline() -> None:
         _pool = pool
         _checkpointer = checkpointer
         _intake_graph = _build_intake_graph().compile(checkpointer=checkpointer)
+        _doctor_intake_graph = _build_doctor_intake_graph().compile(
+            checkpointer=checkpointer
+        )
         _reassessment_graph = _build_reassessment_graph().compile(
             checkpointer=checkpointer
         )
@@ -272,13 +335,14 @@ async def shutdown_pipeline() -> None:
     """
     Close the checkpointer pool. Safe to call multiple times.
     """
-    global _pool, _checkpointer, _intake_graph, _reassessment_graph
+    global _pool, _checkpointer, _intake_graph, _doctor_intake_graph, _reassessment_graph
 
     async with _init_lock:
         pool = _pool
         _pool = None
         _checkpointer = None
         _intake_graph = None
+        _doctor_intake_graph = None
         _reassessment_graph = None
 
     if pool is None:
@@ -294,7 +358,11 @@ async def shutdown_pipeline() -> None:
 
 
 def _require_initialised() -> None:
-    if _intake_graph is None or _reassessment_graph is None:
+    if (
+        _intake_graph is None
+        or _doctor_intake_graph is None
+        or _reassessment_graph is None
+    ):
         raise RuntimeError(
             "pipeline not initialised; call init_pipeline() at startup"
         )
@@ -304,6 +372,12 @@ def get_intake_graph() -> Any:
     """Return the compiled intake graph. Raises if init was not called."""
     _require_initialised()
     return _intake_graph
+
+
+def get_doctor_intake_graph() -> Any:
+    """Return the compiled doctor-intake graph. Raises if init was not called."""
+    _require_initialised()
+    return _doctor_intake_graph
 
 
 def get_reassessment_graph() -> Any:
@@ -316,6 +390,8 @@ def get_graph_for(pipeline_type: str) -> Any:
     """Dispatch by `pipeline_type` from state/db."""
     if pipeline_type == PIPELINE_TYPE_INTAKE:
         return get_intake_graph()
+    if pipeline_type == PIPELINE_TYPE_INTAKE_DOCTOR:
+        return get_doctor_intake_graph()
     if pipeline_type == PIPELINE_TYPE_REASSESSMENT:
         return get_reassessment_graph()
     raise ValueError(f"unknown pipeline_type: {pipeline_type!r}")
@@ -339,6 +415,7 @@ __all__ = [
     "init_pipeline",
     "shutdown_pipeline",
     "get_intake_graph",
+    "get_doctor_intake_graph",
     "get_reassessment_graph",
     "get_graph_for",
     "run_config",

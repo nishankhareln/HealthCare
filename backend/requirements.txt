@@ -141,14 +141,27 @@ python-jose[cryptography]==3.3.0
 # several high-severity CVEs over the last two years; keep this tight.
 cryptography==44.0.0
 
-# cachetools backs the Cognito JWKS TTLCache in auth.py. The cache TTL
-# is configurable via COGNITO_JWKS_CACHE_TTL.
+# cachetools — kept around for any TTL-cache use (was Cognito JWKS in
+# the previous design; no longer required by auth.py but useful for
+# future short-lived caches).
 cachetools==5.5.0
 
-# httpx is the async HTTP client used by auth.py to fetch the Cognito
-# JWKS document. The close_http_client() teardown in main.py's lifespan
-# closes the shared client on shutdown.
+# httpx — async HTTP client. Auth no longer uses it (Cognito removed),
+# but it remains useful for any outbound HTTP call we add later. Kept
+# pinned for CVE tracking.
 httpx==0.28.1
+
+# passlib backs the bcrypt password hashing in auth.py. The bcrypt
+# extra installs the C-accelerated bcrypt library underneath.
+passlib[bcrypt]==1.7.4
+
+# bcrypt is pinned explicitly to 4.0.1. passlib 1.7.4 reads
+# `bcrypt.__about__.__version__` at import time, which bcrypt >= 4.1
+# removed; without this pin every hash/verify call raises AttributeError
+# on import and the secondary self-test ("detect_wrap_bug") explodes
+# against bcrypt 4.1+'s strict 72-byte enforcement. 4.0.1 is the last
+# release before that change and is what passlib expects.
+bcrypt==4.0.1
 
 
 # -----------------------------------------------------------------------------
