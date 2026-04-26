@@ -1,0 +1,96 @@
+# =============================================================================
+# Samni Labs — .gitignore
+# =============================================================================
+# Never commit: secrets, virtualenvs, caches, build artifacts, IDE files.
+
+# -------- Secrets / environment --------
+# The app reads runtime config from .env. These files hold real DB
+# passwords, AWS credentials, and Cognito client secrets — NEVER commit.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# -------- Python --------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtualenvs (any name)
+venv/
+.venv/
+env/
+ENV/
+
+# Package build outputs
+build/
+dist/
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+
+# -------- Node (in case frontend lands here) --------
+node_modules/
+
+# -------- Flutter / Dart (mobile/ app) --------
+# Build output, caches, and platform-generated files. Source lives in
+# mobile/lib, mobile/pubspec.yaml, and the top-level platform folders
+# (android/, ios/) — everything below is regenerated on `flutter pub get`.
+mobile/.dart_tool/
+mobile/.flutter-plugins
+mobile/.flutter-plugins-dependencies
+mobile/.packages
+mobile/.pub-cache/
+mobile/.pub/
+mobile/build/
+mobile/ios/Pods/
+mobile/ios/.symlinks/
+mobile/ios/Flutter/Flutter.framework
+mobile/ios/Flutter/Flutter.podspec
+mobile/android/.gradle/
+mobile/android/captures/
+mobile/android/gradlew
+mobile/android/gradlew.bat
+mobile/android/local.properties
+mobile/android/**/GeneratedPluginRegistrant.java
+
+# Flutter release artifacts (signed APKs, keystores) — never commit
+*.apk
+*.aab
+*.ipa
+*.keystore
+*.jks
+mobile/android/key.properties
+
+# -------- IDE / OS --------
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# -------- Local Docker / tooling --------
+docker-compose.override.yml
+
+# -------- Logs / local run artifacts --------
+*.log
+logs/
+tmp/
+*.pid
