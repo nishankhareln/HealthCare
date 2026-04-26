@@ -62,7 +62,6 @@ PHI_FIELDS: frozenset[str] = frozenset(
     {
         "master_json",
         "transcript",
-        "transcript_segments",
         "raw_pages",
         "proposed_updates",
         "verified_updates",
@@ -108,6 +107,7 @@ class PipelineState(TypedDict, total=False):
     # ---- Inputs (S3 keys — files live in S3, not in state) --------------- #
     pdf_s3_key: Optional[str]
     audio_s3_key: Optional[str]
+    transcript_s3_key: Optional[str]
 
     # ---- Parser output (intake only) ------------------------------------- #
     raw_pages: Optional[list[Any]]
@@ -117,9 +117,11 @@ class PipelineState(TypedDict, total=False):
     # constructed by parse_pdf for intake.
     master_json: dict[str, Any]
 
-    # ---- Transcription --------------------------------------------------- #
+    # ---- Transcript (produced by the transcribe node) -------------------- #
+    # The transcribe node calls Amazon Transcribe Medical against
+    # `audio_s3_key`, writes the result JSON to `transcript_s3_key`, and
+    # places the raw text here for `llm_map` to consume.
     transcript: Optional[str]
-    transcript_segments: Optional[list[Any]]
 
     # ---- LLM stages ------------------------------------------------------ #
     proposed_updates: Optional[list[dict[str, Any]]]
@@ -168,6 +170,10 @@ def new_pipeline_state(
     layer enforces. Defense in depth: even if state construction somehow
     bypassed the normal HTTP path (e.g. a rehydrated checkpoint or a
     future admin CLI), we still reject malformed identifiers here.
+
+    For reassessment, the worker passes `audio_s3_key`; the transcribe
+    node consumes it inside the graph, calls Amazon Transcribe Medical,
+    and writes back `transcript` and `transcript_s3_key`.
     """
     if not isinstance(run_id, str) or not _RUN_ID_RE.match(run_id):
         raise ValueError("run_id must be a UUIDv4-format string")
@@ -263,6 +269,7 @@ def summarize_state(state: PipelineState | dict[str, Any]) -> dict[str, Any]:
         "has_error": get("error") is not None,
         "has_pdf_key": get("pdf_s3_key") is not None,
         "has_audio_key": get("audio_s3_key") is not None,
+        "has_transcript_key": get("transcript_s3_key") is not None,
         "has_output_pdf_key": get("output_pdf_s3_key") is not None,
         "has_transcript": get("transcript") is not None,
         "master_json_populated": bool(get("master_json")),
@@ -274,7 +281,6 @@ def summarize_state(state: PipelineState | dict[str, Any]) -> dict[str, Any]:
         "approved_count": _list_len(get("approved_updates")),
         "audit_entries_count": _list_len(get("audit_entries")),
         "raw_pages_count": _list_len(get("raw_pages")),
-        "transcript_segments_count": _list_len(get("transcript_segments")),
     }
 
 

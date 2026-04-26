@@ -82,7 +82,13 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from auth import AuthenticatedUser, close_http_client, get_current_user
+from auth import (
+    AuthenticatedUser,
+    close_http_client,
+    get_current_user,
+    issue_access_token,
+    verify_password,
+)
 from aws_clients import (
     _client_error_code,
     get_s3_client,
@@ -92,25 +98,35 @@ from aws_clients import (
 from config import Settings, get_settings
 from database import check_db_connectivity, get_db, init_db, shutdown_db
 from db_models import (
-    PIPELINE_STATUS_COMPLETE,
     PIPELINE_STATUS_FAILED,
     PIPELINE_STATUS_QUEUED,
     PIPELINE_STATUS_WAITING_REVIEW,
     PIPELINE_TYPE_INTAKE,
+    PIPELINE_TYPE_INTAKE_DOCTOR,
     PIPELINE_TYPE_REASSESSMENT,
     Patient,
     PipelineRun,
 )
+from db_models import APPROVAL_METHOD_HUMAN, AuditEntry, User
 from models import (
+    AuthMeResponse,
+    LoginRequest,
+    LoginResponse,
     DownloadUrlResponse,
     ErrorResponse,
     HealthResponse,
     IntakeRequest,
+    PatientCreateRequest,
+    PatientDetailResponse,
+    PatientListItem,
+    PatientListResponse,
+    PatientPatchRequest,
     PatientStatusResponse,
     PipelineResponse,
     ReassessmentRequest,
     ReviewResponse,
     ReviewSubmission,
+    SignedPdfRequest,
     SQSMessage,
     UploadUrlRequest,
     UploadUrlResponse,
@@ -119,7 +135,7 @@ from pipeline import (
     init_pipeline,
     shutdown_pipeline,
 )
-from utils import generate_run_id, get_nested, utc_now
+from utils import generate_run_id, get_nested, set_nested, utc_now
 
 
 logger = logging.getLogger(__name__)
@@ -137,7 +153,12 @@ logger = logging.getLogger(__name__)
 # client pass an arbitrary extension.
 _UPLOAD_EXTENSION_BY_TYPE: Final[dict[str, str]] = {
     "pdf": "pdf",
+    # Flutter records audio on-device and uploads it here. The backend's
+    # transcribe node feeds it to Amazon Transcribe Medical.
     "audio": "m4a",
+    # Flutter renders + signs the WAC-388-76-615 template on-device, then
+    # uploads the signed PDF here for the legal archive.
+    "signed_pdf": "pdf",
 }
 _CONTENT_TYPE_BY_EXT: Final[dict[str, str]] = {
     "pdf": "application/pdf",
@@ -146,6 +167,7 @@ _CONTENT_TYPE_BY_EXT: Final[dict[str, str]] = {
 _KEY_PREFIX_BY_TYPE: Final[dict[str, str]] = {
     "pdf": "uploads/",
     "audio": "audio/",
+    "signed_pdf": "signed/",
 }
 
 # TTL for presigned upload URLs. Shorter than S3_PRESIGNED_EXPIRY floor
@@ -895,6 +917,93 @@ async def intake(
 
 
 # --------------------------------------------------------------------------- #
+# POST /intake/doctor
+# --------------------------------------------------------------------------- #
+@app.post(
+    "/intake/doctor",
+    response_model=PipelineResponse,
+    tags=["pipeline"],
+)
+async def intake_doctor(
+    body: IntakeRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> PipelineResponse:
+    """
+    Start a doctor-PDF intake pipeline.
+
+    Caregiver uploads a doctor-supplied PDF (~15 pages, ~6 pages of useful
+    content) covering the resident's medical conditions, diagnoses, and
+    medications. This endpoint queues a `intake_doctor` pipeline run that:
+
+      * Parses the PDF using Bedrock Sonnet 4.5 with a doctor-PDF-specific
+        prompt that extracts ONLY the medical schema fields.
+      * Deep-merges the medical extraction into the existing
+        `patients.assessment` JSON, preserving caregiver-owned fields
+        (mobility, ADLs, etc.).
+      * Writes one audit_trail row per CHANGED medical field.
+
+    Unlike /intake this REQUIRES the patient row to already exist —
+    a doctor PDF is only meaningful for an enrolled resident. We do NOT
+    upsert the patient here.
+    """
+    _require_prefix(body.s3_key, _KEY_PREFIX_BY_TYPE["pdf"])
+
+    await _authorize_patient_access(
+        session, patient_id=body.patient_id, user=user
+    )
+
+    run_id = generate_run_id()
+    run = PipelineRun(
+        run_id=run_id,
+        patient_id=body.patient_id,
+        pipeline_type=PIPELINE_TYPE_INTAKE_DOCTOR,
+        status=PIPELINE_STATUS_QUEUED,
+        user_id=user.id,
+        s3_key=body.s3_key,
+    )
+    try:
+        session.add(run)
+        await session.commit()
+    except SQLAlchemyError:
+        await session.rollback()
+        logger.exception("intake_doctor: failed to insert pipeline_runs row")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database unavailable",
+        )
+
+    message = SQSMessage(
+        run_id=run_id,
+        patient_id=body.patient_id,
+        s3_key=body.s3_key,
+        pipeline_type=PIPELINE_TYPE_INTAKE_DOCTOR,
+        user_id=user.id,
+    )
+    try:
+        await _enqueue_sqs(settings, message)
+    except HTTPException:
+        await _mark_run_failed_after_enqueue_error(
+            session, run_id=run_id, reason="queue_unavailable_at_enqueue"
+        )
+        raise
+
+    logger.info(
+        "intake_doctor enqueued run_id=%s patient_id=%s user_id=%s",
+        run_id,
+        body.patient_id,
+        user.id,
+    )
+
+    return PipelineResponse(
+        run_id=run_id,
+        status=PIPELINE_STATUS_QUEUED,
+        message="Doctor PDF intake pipeline queued.",
+    )
+
+
+# --------------------------------------------------------------------------- #
 # POST /reassessment
 # --------------------------------------------------------------------------- #
 @app.post(
@@ -914,8 +1023,12 @@ async def reassessment(
     Unlike /intake this REQUIRES the patient row to already exist and to
     belong to the caller's facility — reassessment mutates an existing
     record and cross-facility access would be a data breach.
+
+    Flutter records the dictation on-device and uploads the audio file
+    to S3 under the `audio/` prefix. The backend's transcribe node calls
+    Amazon Transcribe Medical against that audio.
     """
-    _require_prefix(body.s3_key, _KEY_PREFIX_BY_TYPE["audio"])
+    _require_prefix(body.audio_s3_key, _KEY_PREFIX_BY_TYPE["audio"])
 
     await _authorize_patient_access(session, patient_id=body.patient_id, user=user)
 
@@ -926,7 +1039,7 @@ async def reassessment(
         pipeline_type=PIPELINE_TYPE_REASSESSMENT,
         status=PIPELINE_STATUS_QUEUED,
         user_id=user.id,
-        s3_key=body.s3_key,
+        s3_key=body.audio_s3_key,
     )
     try:
         session.add(run)
@@ -942,7 +1055,7 @@ async def reassessment(
     message = SQSMessage(
         run_id=run_id,
         patient_id=body.patient_id,
-        s3_key=body.s3_key,
+        s3_key=body.audio_s3_key,
         pipeline_type=PIPELINE_TYPE_REASSESSMENT,
         user_id=user.id,
     )
@@ -1249,14 +1362,16 @@ async def get_download_url(
     settings: Settings = Depends(get_settings),
 ) -> DownloadUrlResponse:
     """
-    Return a short-TTL presigned GET URL for the most recent completed
-    pipeline run's output PDF.
+    Return a short-TTL presigned GET URL for the most recent SIGNED PDF.
 
-    NOTE: `generate_pdf` is currently a placeholder that stores no PDF —
-    every completed run will have output_pdf_s3_key=NULL and this endpoint
-    will 404 until the real renderer lands. The 404 is preferred over a
-    silent stub URL because a caregiver would waste time opening a broken
-    link.
+    Flutter renders the WAC-388-76-615 care-plan template on-device from the
+    patient JSON, captures the caregiver's signature, and uploads the signed
+    PDF via POST /signed-pdf/{run_id}. This endpoint serves that signed
+    artifact back to authorized callers (e.g., for emailing to the case
+    manager or printing for the chart).
+
+    Returns 404 if no signed PDF has been uploaded for this patient yet —
+    the backend never generates PDFs itself.
     """
     await _authorize_patient_access(session, patient_id=patient_id, user=user)
 
@@ -1265,22 +1380,21 @@ async def get_download_url(
         .where(
             and_(
                 PipelineRun.patient_id == patient_id,
-                PipelineRun.status == PIPELINE_STATUS_COMPLETE,
-                PipelineRun.output_pdf_s3_key.isnot(None),
+                PipelineRun.signed_pdf_s3_key.isnot(None),
             )
         )
-        .order_by(desc(PipelineRun.created_at))
+        .order_by(desc(PipelineRun.signed_at))
         .limit(1)
     )
 
-    if latest is None or not latest.output_pdf_s3_key:
+    if latest is None or not latest.signed_pdf_s3_key:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="No generated PDF is available for this patient yet",
+            detail="No signed PDF is available for this patient yet",
         )
 
     url, ttl = await _generate_presigned_get(
-        settings, s3_key=latest.output_pdf_s3_key
+        settings, s3_key=latest.signed_pdf_s3_key
     )
 
     logger.info(
@@ -1295,6 +1409,562 @@ async def get_download_url(
         download_url=url,
         expires_in=ttl,
         generated_at=utc_now(),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# POST /signed-pdf/{run_id}
+# --------------------------------------------------------------------------- #
+@app.post(
+    "/signed-pdf/{run_id}",
+    status_code=status.HTTP_200_OK,
+    tags=["review"],
+)
+async def register_signed_pdf(
+    body: SignedPdfRequest,
+    run_id: str = Path(..., min_length=1, max_length=64),
+    user: AuthenticatedUser = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Register a Flutter-uploaded signed PDF against a completed pipeline run.
+
+    Flow:
+      1. Flutter renders the WAC-388-76-615 template from the patient JSON
+         and captures the caregiver's signature.
+      2. Flutter calls POST /get-upload-url with upload_type='signed_pdf'
+         and uploads the rendered bytes directly to S3.
+      3. Flutter calls THIS endpoint with the returned S3 key and the
+         template_version identifier.
+      4. Backend verifies facility-scoped access to the run's patient,
+         records the S3 key + signed_at on the pipeline_runs row, and
+         stamps template_version on the patient record.
+
+    Idempotent — if `signed_pdf_s3_key` is already set to the same value,
+    we accept; if it's set to a different value, we replace (latest signed
+    copy wins, with the audit trail recording the version history via
+    `signed_at`).
+    """
+    run = await session.scalar(
+        select(PipelineRun).where(PipelineRun.run_id == run_id)
+    )
+    if run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pipeline run not found",
+        )
+
+    await _authorize_patient_access(
+        session, patient_id=run.patient_id, user=user
+    )
+
+    # The caller must have asked for an upload URL of the right type;
+    # _validate_s3_key on SignedPdfRequest already enforces the 'signed/'
+    # prefix, but we re-check here in case the validator is ever relaxed.
+    _require_prefix(body.s3_key, _KEY_PREFIX_BY_TYPE["signed_pdf"])
+
+    now = utc_now()
+
+    await session.execute(
+        update(PipelineRun)
+        .where(PipelineRun.run_id == run_id)
+        .values(signed_pdf_s3_key=body.s3_key, signed_at=now)
+    )
+    await session.execute(
+        update(Patient)
+        .where(Patient.patient_id == run.patient_id)
+        .values(template_version=body.template_version)
+    )
+    await session.commit()
+
+    logger.info(
+        "signed_pdf registered run_id=%s patient_id=%s user_id=%s "
+        "template_version=%s",
+        run_id,
+        run.patient_id,
+        user.id,
+        body.template_version,
+    )
+
+    return {
+        "run_id": run_id,
+        "patient_id": run.patient_id,
+        "signed_at": now,
+        "status": "registered",
+    }
+
+
+# --------------------------------------------------------------------------- #
+# POST /auth/login
+# --------------------------------------------------------------------------- #
+@app.post(
+    "/auth/login",
+    response_model=LoginResponse,
+    tags=["auth"],
+)
+async def auth_login(
+    body: LoginRequest,
+    session: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> LoginResponse:
+    """
+    Verify username + password against the `users` table and issue a JWT.
+
+    Security posture:
+      * Password is bcrypt-verified — constant-time comparison via passlib.
+      * Failure case never tells the caller WHICH part was wrong (no
+        "user exists / wrong password" oracle). One uniform 401.
+      * On success, we update `last_login_at` for operator visibility.
+      * We never log the password, never log the issued token, never log
+        the password hash. Username and user_id only.
+    """
+    # Same lookup whether or not the user exists — keeps timing close to
+    # constant. We still call verify_password against the FAKE hash
+    # below so attackers cannot easily distinguish "no such user" from
+    # "wrong password" by response time alone.
+    user_row = await session.scalar(
+        select(User).where(User.username == body.username)
+    )
+
+    if user_row is None:
+        # Compare the supplied password against a known-bad hash so the
+        # CPU cost of a missed-username path approximately matches the
+        # cost of a wrong-password path.
+        verify_password(body.password, "$2b$12$invalidinvalidinvalidinvalidinvalidinvalidinvalidinvalidinva")
+        logger.info("auth_login: failed (no such user) attempt_username=%s", body.username)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid username or password",
+        )
+
+    if not verify_password(body.password, user_row.password_hash):
+        logger.info("auth_login: failed (bad password) user_id=%s", user_row.id)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid username or password",
+        )
+
+    token, expires_in = issue_access_token(
+        user_id=user_row.id,
+        username=user_row.username,
+        settings=settings,
+    )
+
+    user_row.last_login_at = utc_now()
+    try:
+        await session.commit()
+    except SQLAlchemyError:
+        # Login still succeeded — failing to record `last_login_at`
+        # should not break the user's session. Roll back the timestamp
+        # write only.
+        await session.rollback()
+        logger.warning("auth_login: failed to record last_login_at user_id=%s", user_row.id)
+
+    logger.info("auth_login: success user_id=%s", user_row.id)
+
+    return LoginResponse(
+        access_token=token,
+        token_type="bearer",
+        expires_in=expires_in,
+        user=AuthMeResponse(id=user_row.id, username=user_row.username),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# GET /auth/me
+# --------------------------------------------------------------------------- #
+@app.get(
+    "/auth/me",
+    response_model=AuthMeResponse,
+    tags=["auth"],
+)
+async def auth_me(
+    user: AuthenticatedUser = Depends(get_current_user),
+) -> AuthMeResponse:
+    """
+    Return the authenticated caller's identity for UI display.
+
+    Note we never expose the raw JWT or any claim outside the small set
+    of fields below — token contents stay server-side.
+    """
+    return AuthMeResponse(id=user.id, username=user.username)
+
+
+# --------------------------------------------------------------------------- #
+# POST /patients
+# --------------------------------------------------------------------------- #
+@app.post(
+    "/patients",
+    response_model=PatientDetailResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["patients"],
+)
+async def create_patient(
+    body: PatientCreateRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+) -> PatientDetailResponse:
+    """
+    Create an empty patient record.
+
+    Caregiver supplies the ACES ID + preferred name. The assessment JSON
+    starts empty; it gets populated later by an /intake or /reassessment
+    run, or directly via PATCH for caregiver edits.
+
+    Facility defaults to the caller's facility unless explicitly set —
+    cross-facility creation requires the explicit facility_id and is
+    typically denied at the authz layer (caller can only act within
+    their own facility).
+    """
+    # Caller's own facility unless they explicitly named one. We do not
+    # let a caller "claim" a patient into a facility that isn't theirs.
+    facility = body.facility_id or user.facility_id
+    if facility and user.facility_id and facility != user.facility_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Cannot create a patient outside your facility",
+        )
+
+    # Conflict-safe insert: if the patient_id already exists (and isn't
+    # archived), 409. If it exists archived, also 409 with a clearer
+    # message — admin must un-archive deliberately, not by re-create.
+    existing = await session.scalar(
+        select(Patient).where(Patient.patient_id == body.patient_id)
+    )
+    if existing is not None:
+        if existing.archived_at is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "Patient exists but is archived. Un-archive via admin "
+                    "tooling rather than re-creating."
+                ),
+            )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Patient with this ACES ID already exists",
+        )
+
+    new_patient = Patient(
+        patient_id=body.patient_id,
+        preferred_name=body.preferred_name,
+        facility_id=facility,
+        assessment={},
+        updated_by=user.id,
+    )
+    try:
+        session.add(new_patient)
+        await session.commit()
+    except SQLAlchemyError:
+        await session.rollback()
+        logger.exception("create_patient: insert failed")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database unavailable",
+        )
+
+    await session.refresh(new_patient)
+
+    logger.info(
+        "patient created patient_id=%s facility=%s user_id=%s",
+        body.patient_id,
+        facility,
+        user.id,
+    )
+
+    return PatientDetailResponse(
+        patient_id=new_patient.patient_id,
+        preferred_name=new_patient.preferred_name,
+        facility_id=new_patient.facility_id,
+        assessment=new_patient.assessment,
+        created_at=new_patient.created_at,
+        updated_at=new_patient.updated_at,
+        updated_by=new_patient.updated_by,
+        template_version=new_patient.template_version,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# GET /patients
+# --------------------------------------------------------------------------- #
+_LIST_LIMIT_DEFAULT = 50
+_LIST_LIMIT_MAX = 200
+
+
+@app.get(
+    "/patients",
+    response_model=PatientListResponse,
+    tags=["patients"],
+)
+async def list_patients(
+    limit: int = _LIST_LIMIT_DEFAULT,
+    offset: int = 0,
+    user: AuthenticatedUser = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+) -> PatientListResponse:
+    """
+    Paginated list of patients in the caller's facility.
+
+    Excludes archived patients. The response is deliberately slim — no
+    assessment JSON. Flutter calls GET /patients/{patient_id} to load
+    the full record when the caregiver opens a patient.
+    """
+    if limit < 1 or limit > _LIST_LIMIT_MAX:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"limit must be between 1 and {_LIST_LIMIT_MAX}",
+        )
+    if offset < 0:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="offset must be non-negative",
+        )
+
+    base = select(Patient).where(Patient.archived_at.is_(None))
+    if user.facility_id:
+        base = base.where(Patient.facility_id == user.facility_id)
+
+    # Count first so the client knows how many pages exist.
+    from sqlalchemy import func as sa_func  # local import — used only here
+    count_stmt = base.with_only_columns(sa_func.count(Patient.patient_id))
+    total = (await session.execute(count_stmt)).scalar_one()
+
+    rows = (
+        await session.execute(
+            base.order_by(desc(Patient.updated_at), desc(Patient.created_at))
+            .limit(limit)
+            .offset(offset)
+        )
+    ).scalars().all()
+
+    # Latest run status per patient — one query, indexed.
+    items: list[PatientListItem] = []
+    if rows:
+        patient_ids = [r.patient_id for r in rows]
+        latest_runs = (
+            await session.execute(
+                select(
+                    PipelineRun.patient_id,
+                    PipelineRun.status,
+                    PipelineRun.created_at,
+                )
+                .where(PipelineRun.patient_id.in_(patient_ids))
+                .order_by(PipelineRun.patient_id, desc(PipelineRun.created_at))
+            )
+        ).all()
+        latest_status_by_patient: dict[str, str] = {}
+        for pid, st, _ in latest_runs:
+            if pid not in latest_status_by_patient:
+                latest_status_by_patient[pid] = st
+
+        for r in rows:
+            items.append(
+                PatientListItem(
+                    patient_id=r.patient_id,
+                    preferred_name=r.preferred_name,
+                    facility_id=r.facility_id,
+                    updated_at=r.updated_at,
+                    latest_run_status=latest_status_by_patient.get(r.patient_id),
+                )
+            )
+
+    return PatientListResponse(
+        items=items,
+        total=int(total),
+        limit=limit,
+        offset=offset,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# GET /patients/{patient_id}
+# --------------------------------------------------------------------------- #
+@app.get(
+    "/patients/{patient_id}",
+    response_model=PatientDetailResponse,
+    tags=["patients"],
+)
+async def get_patient(
+    patient_id: str = Path(..., min_length=9, max_length=9, pattern=r"^\d{9}$"),
+    user: AuthenticatedUser = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+) -> PatientDetailResponse:
+    """
+    Full patient record including the assessment JSON.
+
+    Returns 404 if archived or outside the caller's facility — we do not
+    distinguish "doesn't exist" from "you can't see it" to avoid leaking
+    membership of the patient population.
+    """
+    await _authorize_patient_access(session, patient_id=patient_id, user=user)
+
+    row = await session.scalar(
+        select(Patient).where(
+            and_(
+                Patient.patient_id == patient_id,
+                Patient.archived_at.is_(None),
+            )
+        )
+    )
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Patient not found"
+        )
+
+    return PatientDetailResponse(
+        patient_id=row.patient_id,
+        preferred_name=row.preferred_name,
+        facility_id=row.facility_id,
+        assessment=row.assessment,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+        updated_by=row.updated_by,
+        template_version=row.template_version,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# PATCH /patients/{patient_id}
+# --------------------------------------------------------------------------- #
+@app.patch(
+    "/patients/{patient_id}",
+    response_model=PatientDetailResponse,
+    tags=["patients"],
+)
+async def patch_patient(
+    body: PatientPatchRequest,
+    patient_id: str = Path(..., min_length=9, max_length=9, pattern=r"^\d{9}$"),
+    user: AuthenticatedUser = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+) -> PatientDetailResponse:
+    """
+    Caregiver-driven correction to a patient record.
+
+    Two kinds of updates can ride on a single PATCH:
+      * Top-level metadata (`preferred_name`, `facility_id`).
+      * Field-level edits to the assessment JSON via `assessment_patch`,
+        a flat `{ "dotted.path": new_value }` map.
+
+    Every changed assessment field writes one append-only `audit_trail`
+    row with `approval_method='human'` so the change is attributable to
+    the caregiver, not the LLM. The previous value is captured as the
+    audit `old_value`.
+
+    A run_id is generated for the PATCH itself so caregiver edits are
+    traceable as a synthetic "manual" run in the audit history.
+    """
+    await _authorize_patient_access(session, patient_id=patient_id, user=user)
+
+    if (
+        body.preferred_name is None
+        and body.facility_id is None
+        and not body.assessment_patch
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="At least one of preferred_name, facility_id, "
+            "or assessment_patch must be supplied",
+        )
+
+    row = await session.scalar(
+        select(Patient).where(
+            and_(
+                Patient.patient_id == patient_id,
+                Patient.archived_at.is_(None),
+            )
+        )
+    )
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Patient not found"
+        )
+
+    # Defence-in-depth: if a caller tries to move a patient into a foreign
+    # facility, refuse. Same posture as create_patient.
+    if (
+        body.facility_id is not None
+        and user.facility_id
+        and body.facility_id != user.facility_id
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Cannot reassign a patient to a different facility",
+        )
+
+    # Apply assessment patches into a deep-copied dict — we want to
+    # preserve the original until the audit rows are queued.
+    patch_run_id = generate_run_id()
+    audit_rows: list[AuditEntry] = []
+
+    new_assessment: dict[str, Any] = copy.deepcopy(row.assessment) if row.assessment else {}
+    if body.assessment_patch:
+        for field_path, new_value in body.assessment_patch.items():
+            old_value = get_nested(new_assessment, field_path)
+            if old_value == new_value:
+                continue  # no-op edit
+            try:
+                set_nested(new_assessment, field_path, new_value)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=f"Invalid assessment_patch path: "
+                    f"{type(exc).__name__}",
+                )
+            audit_rows.append(
+                AuditEntry(
+                    patient_id=patient_id,
+                    run_id=patch_run_id,
+                    field_path=field_path,
+                    old_value=json.dumps(old_value, default=str)
+                    if old_value is not None
+                    else None,
+                    new_value=json.dumps(new_value, default=str),
+                    source_phrase=None,
+                    confidence=None,
+                    user_id=user.id,
+                    approval_method=APPROVAL_METHOD_HUMAN,
+                )
+            )
+
+    # Apply scalar field updates.
+    if body.preferred_name is not None:
+        row.preferred_name = body.preferred_name
+    if body.facility_id is not None:
+        row.facility_id = body.facility_id
+    if body.assessment_patch:
+        row.assessment = new_assessment
+    row.updated_by = user.id
+
+    try:
+        if audit_rows:
+            session.add_all(audit_rows)
+        await session.commit()
+    except SQLAlchemyError:
+        await session.rollback()
+        logger.exception("patch_patient: commit failed")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database unavailable",
+        )
+
+    await session.refresh(row)
+
+    logger.info(
+        "patient patched patient_id=%s user_id=%s field_changes=%d",
+        patient_id,
+        user.id,
+        len(audit_rows),
+    )
+
+    return PatientDetailResponse(
+        patient_id=row.patient_id,
+        preferred_name=row.preferred_name,
+        facility_id=row.facility_id,
+        assessment=row.assessment,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+        updated_by=row.updated_by,
+        template_version=row.template_version,
     )
 
 

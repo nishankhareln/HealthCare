@@ -145,21 +145,30 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------ #
-    # Cognito
+    # Authentication (backend-managed JWTs — no Cognito)
     # ------------------------------------------------------------------ #
-    COGNITO_USER_POOL_ID: str = Field(
+    JWT_SECRET_KEY: str = Field(
         default="",
-        description="Cognito User Pool ID, e.g. 'us-east-1_AbCdEfGhI'.",
+        description=(
+            "HMAC secret used to sign and verify all backend-issued JWTs. "
+            "MUST be a long random value in non-dev (>= 64 bytes of entropy). "
+            "Generate once with `python -c 'import secrets; "
+            "print(secrets.token_urlsafe(64))'`. Never commit."
+        ),
     )
-    COGNITO_APP_CLIENT_ID: str = Field(
-        default="",
-        description="Cognito App Client ID used as the JWT audience claim.",
+    JWT_ALGORITHM: str = Field(
+        default="HS256",
+        description="JWT signing algorithm. HS256 (HMAC-SHA256) only.",
     )
-    COGNITO_JWKS_CACHE_TTL: int = Field(
-        default=3600,
-        ge=60,
-        le=86400,
-        description="Seconds to cache the Cognito JWKS before refetching.",
+    JWT_EXPIRY_MINUTES: int = Field(
+        default=60,
+        ge=5,
+        le=24 * 60,
+        description="How long an access token is valid for, in minutes.",
+    )
+    JWT_ISSUER: str = Field(
+        default="samni-labs",
+        description="JWT `iss` claim — must match what /auth/login issues.",
     )
 
     # ------------------------------------------------------------------ #
@@ -270,9 +279,17 @@ class Settings(BaseSettings):
     @field_validator("DATABASE_URL_SYNC")
     @classmethod
     def _validate_sync_database_url(cls, value: str) -> str:
-        if not value.startswith("postgresql://"):
+        # Accept both psycopg2 (default 'postgresql://') and psycopg3 sync
+        # ('postgresql+psycopg://'). Alembic works with either; environments
+        # where psycopg2's compiled DLL is blocked (e.g. Windows Application
+        # Control) must use the psycopg3 scheme.
+        if not (
+            value.startswith("postgresql://")
+            or value.startswith("postgresql+psycopg://")
+        ):
             raise ValueError(
-                "DATABASE_URL_SYNC must use the 'postgresql://' scheme (used by Alembic)."
+                "DATABASE_URL_SYNC must use 'postgresql://' (psycopg2) or "
+                "'postgresql+psycopg://' (psycopg3). Alembic accepts either."
             )
         parsed = urlparse(value)
         if not parsed.hostname or not parsed.path.lstrip("/"):
@@ -297,13 +314,14 @@ class Settings(BaseSettings):
             raise ValueError("SNS_TOPIC_ARN must be a full SNS topic ARN (arn:aws:sns:...).")
         return value
 
-    @field_validator("COGNITO_USER_POOL_ID")
+    @field_validator("JWT_ALGORITHM")
     @classmethod
-    def _validate_cognito_pool(cls, value: str) -> str:
-        if value and "_" not in value:
-            raise ValueError(
-                "COGNITO_USER_POOL_ID is not in the expected '<region>_<id>' format."
-            )
+    def _validate_jwt_algorithm(cls, value: str) -> str:
+        # Pinned to HS256 — symmetric HMAC. We deliberately do NOT support
+        # `none` or any RSA/ECDSA variant; if you ever need RS256 (third-
+        # party SSO), introduce it as a separate validator path.
+        if value != "HS256":
+            raise ValueError("JWT_ALGORITHM must be 'HS256'")
         return value
 
     # ------------------------------------------------------------------ #
@@ -318,23 +336,6 @@ class Settings(BaseSettings):
     def is_dev(self) -> bool:
         """True when running in the local/dev environment."""
         return self.ENVIRONMENT == "dev"
-
-    @property
-    def cognito_issuer(self) -> str:
-        """The Cognito issuer URL used for JWT `iss` validation."""
-        if not self.COGNITO_USER_POOL_ID:
-            raise RuntimeError(
-                "COGNITO_USER_POOL_ID is not configured; cannot build issuer URL."
-            )
-        return (
-            f"https://cognito-idp.{self.AWS_REGION}.amazonaws.com/"
-            f"{self.COGNITO_USER_POOL_ID}"
-        )
-
-    @property
-    def cognito_jwks_url(self) -> str:
-        """The Cognito JWKS endpoint for JWT signature verification."""
-        return f"{self.cognito_issuer}/.well-known/jwks.json"
 
     # ------------------------------------------------------------------ #
     # Cross-field enforcement
@@ -352,13 +353,19 @@ class Settings(BaseSettings):
 
         required: dict[str, str] = {
             "SQS_QUEUE_URL": self.SQS_QUEUE_URL,
-            "COGNITO_USER_POOL_ID": self.COGNITO_USER_POOL_ID,
-            "COGNITO_APP_CLIENT_ID": self.COGNITO_APP_CLIENT_ID,
+            "JWT_SECRET_KEY": self.JWT_SECRET_KEY,
             "SNS_TOPIC_ARN": self.SNS_TOPIC_ARN,
             "S3_BUCKET": self.S3_BUCKET,
             "DATABASE_URL": self.DATABASE_URL,
             "DATABASE_URL_SYNC": self.DATABASE_URL_SYNC,
         }
+        # JWT_SECRET_KEY must be long enough to be HMAC-safe in non-dev.
+        if self.JWT_SECRET_KEY and len(self.JWT_SECRET_KEY) < 32:
+            raise RuntimeError(
+                "JWT_SECRET_KEY must be at least 32 characters in non-dev. "
+                "Generate one with `python -c 'import secrets; "
+                "print(secrets.token_urlsafe(64))'`."
+            )
         missing = [name for name, value in required.items() if not value]
         if missing:
             raise RuntimeError(
